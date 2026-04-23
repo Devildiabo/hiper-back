@@ -8,13 +8,12 @@ export type Config = {
 };
 
 export const loadConfig = (): Config => {
-  // SEMPRE usar porta 3001 para backend (3000 é do Next.js)
-  // Ignorar variável de ambiente PORT se for 3000
+  // Preferencialmente usar porta 3005 para backend (evitar conflitos com frontends e outros sistemas)
   const envPort = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
-  const port = envPort === 3000 ? 3001 : (envPort || 3001);
+  const port = envPort || 3005;
   
-  if (envPort === 3000) {
-    console.warn('[Config] ⚠️  PORT=3000 detected. Backend must use 3001 (3000 is for Next.js).');
+  if (port >= 3000 && port <= 3002) {
+    console.warn(`[Config] ⚠️  PORT=${port} detected. Recommended to use 3005+ to avoid conflicts with frontends.`);
   }
 
   // Debug: mostrar todas as variáveis de ambiente relacionadas ao Supabase
