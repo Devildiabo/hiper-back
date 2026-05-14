@@ -77,6 +77,11 @@ export const createServer = async (deps: ServerDependencies): Promise<FastifyIns
     if (request.url === '/api/whatsapp/debug/load-test') {
       return;
     }
+    // Pular autenticação para rotas de auth (login/register)
+    if (request.url.startsWith('/api/v1/auth/')) {
+      return;
+    }
+    
     return authMiddleware(request, reply);
   });
   console.log('[Server] Auth middleware registered (except /health and /api/whatsapp/status/stream)');

@@ -74,7 +74,7 @@ export class AuthService {
       const { createClient } = require('@supabase/supabase-js');
       const supabaseUrl = process.env.SUPABASE_URL;
       // Usar chave anônima para sign in (não service role)
-      const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
+      const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
       
       if (supabaseUrl && supabaseAnonKey) {
         // Criar cliente com chave anônima para sign in
@@ -123,38 +123,35 @@ export class AuthService {
    * Suporta tanto sistema antigo (tabela users) quanto novo (auth.users)
    */
   private async getPasswordHash(userId: string): Promise<string | null> {
-    // Se o repository for Postgres, buscar diretamente
-    if (this.repository.constructor.name === 'PostgresAuthRepository') {
-      const { createClient } = require('@supabase/supabase-js');
-      const supabaseUrl = process.env.SUPABASE_URL;
-      const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-      
-      if (!supabaseUrl || !supabaseKey) {
-        return null;
-      }
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+    // Se tivermos as credenciais do Supabase, tentamos buscar no banco
+    if (supabaseUrl && supabaseKey) {
+      const { createClient } = require('@supabase/supabase-js');
       const supabase = createClient(supabaseUrl, supabaseKey);
       
-      // 1. Primeiro tenta buscar na tabela users (sistema antigo)
-      const { data: oldUser, error: oldError } = await supabase
-        .from('users')
-        .select('password_hash')
-        .eq('id', userId)
-        .maybeSingle();
+      try {
+        // 1. Primeiro tenta buscar na tabela users (sistema antigo)
+        const { data: oldUser, error: oldError } = await supabase
+          .from('users')
+          .select('password_hash')
+          .eq('id', userId)
+          .maybeSingle();
 
-      if (oldUser && oldUser.password_hash && !oldError) {
-        return oldUser.password_hash;
+        if (oldUser && oldUser.password_hash && !oldError) {
+          return oldUser.password_hash;
+        }
+      } catch (e) {
+        console.error('[AuthService] Erro ao buscar password_hash na tabela users:', e);
       }
 
-      // 2. Se não encontrou, o usuário está no auth.users (novo sistema)
-      // Para auth.users, não temos acesso ao hash diretamente
-      // Mas podemos verificar a senha usando o Supabase Auth
-      // Retornamos um marcador especial que indica que devemos usar auth.users
-      return 'AUTH_USERS'; // Marcador especial
+      // 2. Se não encontrou ou deu erro, assumimos que pode estar no auth.users
+      return 'AUTH_USERS';
     }
 
-    // Para in-memory, usar método do repository
-    if (typeof (this.repository as any).getPasswordHash === 'function') {
+    // Fallback para in-memory se disponível
+    if (this.repository && typeof (this.repository as any).getPasswordHash === 'function') {
       return (this.repository as any).getPasswordHash(userId);
     }
 
