@@ -1,19 +1,14 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.SUPABASE_URL || 'https://ooancmvihrxzgtegvmwn.supabase.co';
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9vYW5jbXZpaHJ4emd0ZWd2bXduIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTY5OTk1MywiZXhwIjoyMDg1Mjc1OTUzfQ.jJ58G3rKuyiwB2ktw_QQE_4aojc2csOqVtSmLzowGbQ';
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set');
+  console.warn('[Database] ⚠️  SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não definidos ainda. Cliente Supabase pode falhar.');
 }
 
-console.log('[Database] Initializing Supabase client...');
-console.log('[Database] URL:', supabaseUrl);
-console.log('[Database] Service Key:', supabaseServiceKey.substring(0, 20) + '...');
-
-// Criar cliente Supabase com service role key (bypass RLS)
-export const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+// Criar cliente Supabase (usando strings vazias como fallback para evitar crash na criação)
+export const supabase = createClient(supabaseUrl || '', supabaseServiceKey || '', {
   auth: {
     autoRefreshToken: false,
     persistSession: false,

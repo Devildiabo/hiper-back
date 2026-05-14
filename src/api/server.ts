@@ -10,6 +10,8 @@ import { registerNotificationRoutes } from './routes/notifications';
 import { registerTicketRoutes } from './routes/tickets';
 import { registerTeamRoutes } from './routes/team';
 import { registerAIAssistRoutes } from './routes/ai-assist';
+import { registerKnowledgeRoutes } from './routes/knowledge';
+import { KnowledgeService } from '../knowledge/service';
 import { setStatusChangeCallback } from '../whatsapp/watchdog';
 import { eventBus } from '../events';
 import { authMiddleware } from '../auth';
@@ -71,7 +73,8 @@ export const createServer = async (deps: ServerDependencies): Promise<FastifyIns
       return;
     }
     // Pular autenticação para SSE (usa token via query param)
-    if (request.url.startsWith('/api/whatsapp/status/stream')) {
+    // Pular autenticação para rota de debug (TESTE)
+    if (request.url === '/api/whatsapp/debug/load-test') {
       return;
     }
     return authMiddleware(request, reply);
@@ -229,6 +232,9 @@ export const createServer = async (deps: ServerDependencies): Promise<FastifyIns
     return healthStatus;
   });
 
+  // Instanciar KnowledgeService
+  const knowledgeService = new KnowledgeService();
+
   // Registrar rotas diretamente no fastify
   console.log('[Server] Registering routes...');
       try {
@@ -261,6 +267,8 @@ export const createServer = async (deps: ServerDependencies): Promise<FastifyIns
         registerTeamRoutes(fastify);
         // Registrar rotas de AI Assist (Correção Gramatical)
         registerAIAssistRoutes(fastify);
+        // Registrar rotas de Base de Conhecimento
+        registerKnowledgeRoutes(fastify, knowledgeService);
     console.log('[Server] ✅ All routes registered successfully');
     
     // Configurar callback para broadcast de status via SSE (via watchdog)

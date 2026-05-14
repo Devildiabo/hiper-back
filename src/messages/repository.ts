@@ -3,7 +3,7 @@ import type { Message, Conversation } from './types';
 import type { ConversationState } from './types';
 
 export interface IMessageRepository {
-  findByConversationId(conversationId: string, tenantId: string): Message[] | Promise<Message[]>;
+  findByConversationId(conversationId: string, tenantId: string, limit?: number): Message[] | Promise<Message[]>;
   findById(messageId: string, tenantId: string): Message | null | Promise<Message | null>;
   create(message: Message, tenantId: string): void | Promise<void>;
   getAllConversations(tenantId: string): Conversation[] | Promise<Conversation[]>;
@@ -51,6 +51,7 @@ export interface IMessageRepository {
     tenantId: string
   ): void | Promise<void>;
   updateMessageText(messageId: string, text: string, tenantId: string): void | Promise<void>;
+  incrementTokenUsage(conversationId: string, tokens: number, costUsd: number, tenantId: string): void | Promise<void>;
 }
 
 class InMemoryMessageRepository implements IMessageRepository {
@@ -66,13 +67,13 @@ class InMemoryMessageRepository implements IMessageRepository {
    * - Ordem determinística mesmo com timestamps iguais
    * - API sempre retorna já ordenado (frontend não deve fazer sort)
    */
-  findByConversationId(conversationId: string, tenantId: string): Message[] {
+  findByConversationId(conversationId: string, tenantId: string, limit?: number): Message[] {
     const messages = Array.from(this.messages.values())
       .filter((msg) => msg.conversationId === conversationId);
     
     // Ordenação robusta: (timestamp, messageId) como tie-breaker
     // messageId é único, então garante ordem determinística
-    return messages.sort((a, b) => {
+    const sortedMessages = messages.sort((a, b) => {
       // Primeiro critério: timestamp
       if (a.timestamp !== b.timestamp) {
         return a.timestamp - b.timestamp;
@@ -80,6 +81,12 @@ class InMemoryMessageRepository implements IMessageRepository {
       // Segundo critério: messageId (sempre único, garante ordem determinística)
       return a.messageId.localeCompare(b.messageId);
     });
+
+    if (limit && limit > 0) {
+      return sortedMessages.slice(-limit);
+    }
+
+    return sortedMessages;
   }
 
   findById(messageId: string, tenantId: string): Message | null {
@@ -370,6 +377,17 @@ class InMemoryMessageRepository implements IMessageRepository {
       this.messages.set(messageId, {
         ...message,
         text,
+      });
+    }
+  }
+
+  incrementTokenUsage(conversationId: string, tokens: number, costUsd: number, tenantId: string): void {
+    const existing = this.conversations.get(conversationId);
+    if (existing) {
+      this.conversations.set(conversationId, {
+        ...existing,
+        totalTokens: (existing.totalTokens ?? 0) + tokens,
+        totalCostUsd: (existing.totalCostUsd ?? 0) + costUsd,
       });
     }
   }

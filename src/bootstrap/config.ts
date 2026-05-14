@@ -75,9 +75,10 @@ export const loadConfig = (): Config => {
     console.log('[Config] ⚠️  SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables');
     console.log('[Config] ⚠️  Using in-memory storage (data will be lost on restart)');
     console.log('[Config] 💡 To enable Supabase, add both variables to your .env file:');
-    console.log('[Config] 💡   SUPABASE_URL=https://ooancmvihrxzgtegvmwn.supabase.co');
-    console.log('[Config] 💡   SUPABASE_SERVICE_ROLE_KEY=your_service_role_key');
+    console.log('[Config] 💡   SUPABASE_URL=https://<project-id>.supabase.co');
+    console.log('[Config] 💡   SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>');
     console.log('[Config] 💡 Make sure to restart the backend after adding these variables!');
+    console.log('[Config] 💡 Copy .env.example to .env to get started.');
   }
 
   // Configuração de cache de memória
@@ -92,12 +93,12 @@ export const loadConfig = (): Config => {
 
   const finalOpenaiApiKey = openaiApiKey && openaiApiKey.trim().length > 0 ? openaiApiKey.trim() : undefined;
 
-  // No Railway/Docker, usar caminho absoluto dentro do container
-  // Em desenvolvimento local, pode usar caminho relativo
-  const defaultSessionPath = process.env.NODE_ENV === 'production' 
-    ? '/app/sessions'  // Caminho absoluto no container
-    : './sessions';     // Caminho relativo em desenvolvimento
-  
+  // Caminho de sessão WhatsApp — totalmente controlado por variável de ambiente.
+  // Em containers efêmeros, garanta USE_HYBRID_AUTH_CACHE=true para persistência via Redis/Supabase.
+  const defaultSessionPath = process.env.NODE_ENV === 'production'
+    ? '/tmp/whatsapp-sessions'  // Path genérico; sobrescreva via WHATSAPP_SESSION_PATH
+    : './sessions';
+
   return {
     port,
     whatsappSessionPath: process.env.WHATSAPP_SESSION_PATH || defaultSessionPath,

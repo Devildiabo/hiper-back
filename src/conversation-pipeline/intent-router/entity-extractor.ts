@@ -18,8 +18,9 @@ type EntityExtractorInput = {
   messageText: string;
   messageHistory?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>; // Últimas 5 mensagens
   availableStores?: Array<{ id: string; name: string; neighborhood: string }>; // Lista de lojas disponíveis para matching
-  traceId?: string; // Para rastreabilidade
   intent?: string; // Intent já classificado pelo Router (para contexto)
+  conversationId: string;
+  tenantId: string;
 };
 
 type EntityExtractorDependencies = {
@@ -40,13 +41,13 @@ export class EntityExtractorAgent {
     // Usar modelo OpenAI via Vercel AI SDK
     // Usar GPT-4o-mini como principal (otimizado para Structured Outputs JSON)
     this.openai = createOpenAI({ apiKey: deps.openaiApiKey });
-    this.model = this.openai('gpt-4o-mini');
-    // Fallback para gpt-4o caso gpt-4o-mini não esteja disponível
-    this.fallbackModel = this.openai('gpt-4o');
+    this.model = this.openai('gpt-5-nano');
+    // Fallback para gpt-5-nano também
+    this.fallbackModel = this.openai('gpt-5-nano');
     
     logger.pipeline('✅ EntityExtractorAgent inicializado', {
-      primaryModel: 'gpt-4o-mini',
-      fallbackModel: 'gpt-4o',
+      primaryModel: 'gpt-5-nano',
+      fallbackModel: 'gpt-5-nano',
       hasApiKey: !!deps.openaiApiKey,
       apiKeyLength: deps.openaiApiKey.length,
       apiKeyPrefix: deps.openaiApiKey.substring(0, 7) + '...',
@@ -57,7 +58,7 @@ export class EntityExtractorAgent {
   /**
    * Extrai entidades da mensagem atual considerando o histórico
    */
-  async extract(input: EntityExtractorInput): Promise<EntityExtractorResult> {
+  async extract(input: EntityExtractorInput): Promise<EntityExtractorResult & { usage?: { totalTokens: number } }> {
     const traceId = input.traceId || `extract-${Date.now()}`;
     const startTime = Date.now();
 
@@ -282,6 +283,7 @@ Extraia as entidades com precisão máxima, considerando tanto a mensagem atual 
         });
       }
 
+
       const duration = Date.now() - startTime;
       
       logger.pipeline('✅ Extração concluída', {
@@ -293,7 +295,10 @@ Extraia as entidades com precisão máxima, considerando tanto a mensagem atual 
         usedFallback,
       });
 
-      return validatedResult;
+      return {
+        ...validatedResult,
+        usage: (rawResult as any).usage ? { totalTokens: (rawResult as any).usage.totalTokens } : undefined
+      };
     } catch (error) {
       const duration = Date.now() - startTime;
       const errorMessage = error instanceof Error ? error.message : String(error);

@@ -6,7 +6,20 @@
 import jwt from 'jsonwebtoken';
 import type { JWTPayload } from './types';
 
-const JWT_SECRET: jwt.Secret = process.env.JWT_SECRET || 'change-me-in-production';
+const _jwtSecret = process.env.JWT_SECRET;
+if (!_jwtSecret || _jwtSecret.trim().length < 32) {
+  const msg =
+    !_jwtSecret || _jwtSecret.trim() === ''
+      ? '[JWT] FATAL: JWT_SECRET não definida. Gere com: openssl rand -base64 48'
+      : `[JWT] FATAL: JWT_SECRET muito curta (${_jwtSecret.length} chars, mínimo 32). Use: openssl rand -base64 48`;
+  // Em produção, abortar; em dev, apenas alertar
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(msg);
+  } else {
+    console.warn(msg);
+  }
+}
+const JWT_SECRET: jwt.Secret = (_jwtSecret ?? 'dev-only-insecure-secret-do-not-use-in-production').trim();
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 /**

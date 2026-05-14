@@ -25,7 +25,15 @@ type PipelineHandlersDependencies = {
   humanizer?: any; // Agente Boca para humanizar respostas de gerente
 };
 
+let pipelineHandlersWired = false;
+
 export const wirePipelineHandlers = (deps: PipelineHandlersDependencies): void => {
+  if (pipelineHandlersWired) {
+    logger.debug('⚠️ Pipeline handlers already wired - skipping duplicate wiring');
+    return;
+  }
+  pipelineHandlersWired = true;
+
   const { whatsAppAdapter } = deps;
 
   // Handler para evento de reputação em risco
@@ -251,10 +259,8 @@ export const wirePipelineHandlers = (deps: PipelineHandlersDependencies): void =
     }
   });
 
-  /**
-   * Handler para task criada (verificação com gerente)
-   * Envia mensagem ao gerente com o request_code
-   */
+  /* 
+  // DESATIVADO: Fluxo do Gerente (Task Criada)
   eventBus.on('conversation.task.created', async (event: {
     taskId: string;
     conversationId: string;
@@ -531,11 +537,10 @@ export const wirePipelineHandlers = (deps: PipelineHandlersDependencies): void =
       });
     }
   });
+  */
 
-  /**
-   * Handler para task completada (gerente respondeu)
-   * Processa resposta do gerente através do Agente Boca antes de enviar ao cliente
-   */
+  /*
+  // DESATIVADO: Fluxo do Gerente (Task Completada)
   eventBus.on('conversation.task.completed', async (event: {
     taskId: string;
     conversationId: string;
@@ -580,7 +585,7 @@ export const wirePipelineHandlers = (deps: PipelineHandlersDependencies): void =
           taskId: event.taskId,
           currentStatus: task.status,
         });
-        // Continuar mesmo assim, mas logar o aviso
+        // Continuar mesmo assim, mas logar o após
       }
 
       // Buscar loja para obter nome
@@ -671,11 +676,10 @@ export const wirePipelineHandlers = (deps: PipelineHandlersDependencies): void =
       });
     }
   });
+  */
 
-  /**
-   * Handler para task expirada (timeout de 20 minutos)
-   * Envia mensagem ao cliente com telefone da loja
-   */
+  /*
+  // DESATIVADO: Fluxo do Gerente (Task Expirada)
   eventBus.on('conversation.task.expired', async (event: {
     taskId: string;
     conversationId: string;
@@ -763,5 +767,6 @@ export const wirePipelineHandlers = (deps: PipelineHandlersDependencies): void =
       });
     }
   });
+  */
 };
 

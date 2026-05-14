@@ -68,8 +68,8 @@ export class MessageService {
       }
     }
 
-    // Buscar do banco de dados
-    const result = this.repository.findByConversationId(conversationId, finalTenantId);
+    // Buscar do banco de dados passando o limite para a query
+    const result = this.repository.findByConversationId(conversationId, finalTenantId, limit);
     const messages = result instanceof Promise ? await result : result;
 
     // Se cache está habilitado e limit foi especificado, armazenar no cache
@@ -296,6 +296,17 @@ export class MessageService {
       throw new Error('TenantId is required. Either provide it explicitly or set a default tenant.');
     }
     const result = this.repository.updateMessageText(messageId, text, finalTenantId);
+    if (result instanceof Promise) {
+      await result;
+    }
+  }
+
+  async incrementTokenUsage(conversationId: string, tokens: number, costUsd: number, tenantId?: string): Promise<void> {
+    const finalTenantId = tenantId || this.defaultTenantId;
+    if (!finalTenantId) {
+      throw new Error('TenantId is required. Either provide it explicitly or set a default tenant.');
+    }
+    const result = this.repository.incrementTokenUsage(conversationId, tokens, costUsd, finalTenantId);
     if (result instanceof Promise) {
       await result;
     }

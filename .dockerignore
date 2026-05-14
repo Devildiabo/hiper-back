@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+sessions/
+*.log
+*.pem
+*.key
+.git/
+.gitignore
+README*.md
+ENV_*.txt

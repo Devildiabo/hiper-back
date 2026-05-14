@@ -91,5 +91,7 @@ export type Conversation = {
   // Agent tracking
   agentNames?: string[]; // Lista de nomes de agentes que enviaram mensagens nesta conversa (únicos)
   agentColors?: Record<string, string>; // Mapa de nome do agente -> cor (hex)
+  // AI usage tracking
+  totalTokens: number; // Total de tokens consumidos pela IA nesta conversa
+  totalCostUsd: number; // Custo total acumulado em USD
 };
-

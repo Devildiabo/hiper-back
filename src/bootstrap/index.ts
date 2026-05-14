@@ -1,13 +1,17 @@
-// Carregar variáveis de ambiente PRIMEIRO
-import 'dotenv/config';
+import '../pre-bootstrap'; // DEVE SER O PRIMEIRO IMPORT
+import { validateEnv } from './validate-env';
+
+// Executar validação de ambiente antes de qualquer import de serviços
+validateEnv();
+
 
 // Verificar se dotenv carregou corretamente
 console.log('[Bootstrap] 🔍 Environment check:');
 console.log('[Bootstrap] SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ Loaded' : '❌ Not loaded');
 console.log('[Bootstrap] SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ Loaded' : '❌ Not loaded');
 console.log('[Bootstrap] USE_BULLMQ:', process.env.USE_BULLMQ || '❌ Not set');
-console.log('[Bootstrap] REDIS_PUBLIC_URL:', process.env.REDIS_PUBLIC_URL ? `✅ Loaded (${process.env.REDIS_PUBLIC_URL.substring(0, 40)}...)` : '❌ Not loaded');
-console.log('[Bootstrap] REDIS_URL:', process.env.REDIS_URL ? `✅ Loaded (${process.env.REDIS_URL.substring(0, 40)}...)` : '❌ Not loaded');
+console.log('[Bootstrap] REDIS_PUBLIC_URL:', process.env.REDIS_PUBLIC_URL ? `✅ Loaded (masked)` : '❌ Not loaded');
+console.log('[Bootstrap] REDIS_URL:', process.env.REDIS_URL ? `✅ Loaded (masked)` : '❌ Not loaded');
 console.log('[Bootstrap] REDIS_HOST:', process.env.REDIS_HOST || '❌ Not loaded');
 
 import { createServer } from '../api';
@@ -67,7 +71,7 @@ const bootstrap = async (): Promise<void> => {
   } else {
     console.log('[Bootstrap] ⚠️  Using in-memory repository (SUPABASE_URL not set)');
     console.log('[Bootstrap] ⚠️  WARNING: Data will be lost on restart! Set SUPABASE_URL to persist data.');
-    console.log('[Bootstrap] 💡 Add SUPABASE_URL=https://ooancmvihrxzgtegvmwn.supabase.co to your .env file');
+    console.log('[Bootstrap] 💡 Copy .env.example to .env and fill in your Supabase credentials.');
   }
 
   // Inicializar AuthService ANTES de criar MessageService (para obter defaultTenantId)
@@ -190,7 +194,7 @@ const bootstrap = async (): Promise<void> => {
 
   console.log('[Bootstrap] Initializing Conversation Orchestrator (Router-Executor-Humanizer)...');
   console.log('[Bootstrap] OpenAI API Key:', config.openaiApiKey.substring(0, 7) + '...' + config.openaiApiKey.substring(config.openaiApiKey.length - 4));
-  console.log('[Bootstrap] Model: gpt-5-nano (Router e Humanizer)');
+  console.log('[Bootstrap] Model: gpt-5-nano (Router, Executor e Humanizer)');
   
   console.log('[Bootstrap] Creating WhatsApp adapter...');
   // Sistema de autenticação simplificado: apenas arquivos locais
@@ -237,159 +241,76 @@ const bootstrap = async (): Promise<void> => {
       console.warn('[Bootstrap] ⚠️  BullMQ não será inicializado. Tasks serão criadas, mas timeout não será gerenciado.');
     } else {
       try {
+        /* DESATIVADO: Fila de Verificação de Gerente
         const { ManagerVerificationQueue } = await import('../conversation-pipeline/queue/manager-verification-queue');
         
         // Prioridade: RedisPublicURL > RedisUrl > host/port/password
         let redisConnection: string | { host: string; port: number; password?: string; username?: string };
+        */
+        let redisConnection: any;
         let connectionSource = '';
         
         if (process.env.REDIS_PUBLIC_URL) {
-          // Usar URL pública do Redis (Railway)
           redisConnection = process.env.REDIS_PUBLIC_URL.trim();
           connectionSource = 'REDIS_PUBLIC_URL';
-          console.log('[Bootstrap] 🔗 Using REDIS_PUBLIC_URL for BullMQ connection');
         } else if (process.env.REDIS_URL) {
-          // Usar URL do Redis (Railway internal)
           redisConnection = process.env.REDIS_URL.trim();
           connectionSource = 'REDIS_URL';
-          console.log('[Bootstrap] 🔗 Using REDIS_URL for BullMQ connection');
         } else {
-          // Usar host/port/password separados
           const redisHost = (process.env.REDIS_HOST || '').trim();
           const redisPort = parseInt(process.env.REDIS_PORT || '6379', 10);
           const redisPassword = process.env.REDIS_PASSWORD?.trim();
           const redisUser = (process.env.REDIS_USER || process.env.REDIS_USERNAME || '').trim();
           
-          if (!redisHost) {
-            throw new Error('REDIS_HOST não configurado. Configure REDIS_HOST ou use REDIS_PUBLIC_URL/REDIS_URL');
+          if (redisHost) {
+            redisConnection = {
+              host: redisHost,
+              port: redisPort,
+              password: redisPassword,
+              username: redisUser || undefined,
+            };
+            connectionSource = 'REDIS_HOST/REDIS_PORT';
           }
-          
-          redisConnection = {
-            host: redisHost,
-            port: redisPort,
-            password: redisPassword,
-            username: redisUser || undefined,
-          };
-          connectionSource = 'REDIS_HOST/REDIS_PORT';
-          console.log('[Bootstrap] 🔗 Using REDIS_HOST/REDIS_PORT for BullMQ connection', {
-            host: redisHost,
-            port: redisPort,
-            hasPassword: !!redisPassword,
-            hasUsername: !!redisUser,
-          });
         }
         
-        managerQueue = new ManagerVerificationQueue({
-          taskService,
-          whatsAppAdapter,
-          storeService,
-          redisConnection,
-        });
-        
-        // Conectar queue ao taskService
-        taskService.setManagerQueue(managerQueue);
-        
-        const connectionInfo = typeof redisConnection === 'string' 
-          ? { 
-              type: 'URL', 
-              source: connectionSource,
-              url: redisConnection.replace(/:[^:@]+@/, ':****@'), // Mascarar senha na URL
-            }
-          : { 
-              type: 'host/port', 
-              source: connectionSource,
-              host: redisConnection.host, 
-              port: redisConnection.port, 
-              hasPassword: !!redisConnection.password,
-              hasUsername: !!redisConnection.username,
-            };
-        
-        console.log('[Bootstrap] ✅ BullMQ ManagerVerificationQueue initialized', connectionInfo);
-        
-        // Inicializar FeedbackQueue (mesma conexão Redis)
-        try {
-          const { FeedbackQueue } = await import('../conversation-pipeline/queue/feedback-queue');
-          
-          feedbackQueue = new FeedbackQueue({
-            messageService,
+        /* DESATIVADO: Fila de Verificação de Gerente
+        if (redisConnection) {
+          managerQueue = new ManagerVerificationQueue({
+            taskService,
             whatsAppAdapter,
             storeService,
-            humanizer: conversationOrchestrator.humanizer,
-            openaiApiKey: config.openaiApiKey,
             redisConnection,
           });
-          
-          console.log('[Bootstrap] ✅ BullMQ FeedbackQueue initialized');
-          
-          // Atualizar Orchestrator com FeedbackQueue
-          (conversationOrchestrator as any).deps.feedbackQueue = feedbackQueue;
-          // Atualizar Executor com FeedbackQueue e MessageService
-          (conversationOrchestrator as any).executor.deps.feedbackQueue = feedbackQueue;
-          (conversationOrchestrator as any).executor.deps.messageService = messageService;
-          
-          // Inicializar MessageGroupingQueue (mesma conexão Redis)
+          taskService.setManagerQueue(managerQueue);
+        }
+        */
+        
+        // Inicializar MessageGroupingQueue (Única fila mantida ativa)
+        if (redisConnection) {
           try {
             console.log('[Bootstrap] 🔧 Inicializando MessageGroupingQueue...');
-            console.log('[Bootstrap] 📋 Verificando dependências:', {
-              hasOrchestrator: !!conversationOrchestrator,
-              hasMessageService: !!messageService,
-              hasRedisConnection: !!redisConnection,
-              redisConnectionType: typeof redisConnection,
-            });
-            
             const { MessageGroupingQueue } = await import('../conversation-pipeline/queue/message-grouping-queue');
-            console.log('[Bootstrap] ✅ Classe MessageGroupingQueue importada com sucesso');
             
-            console.log('[Bootstrap] 🔨 Instanciando MessageGroupingQueue...');
             messageGroupingQueue = new MessageGroupingQueue({
               conversationOrchestrator,
               messageService,
               redisConnection,
             });
             
-            // Aguardar Redis estar pronto antes de considerar inicializado
-            console.log('[Bootstrap] ⏳ Aguardando Redis estar pronto para MessageGroupingQueue...');
-            try {
-              await messageGroupingQueue.waitForReady();
-              console.log('[Bootstrap] ✅ BullMQ MessageGroupingQueue initialized e Redis pronto');
-            } catch (error) {
-              console.error('[Bootstrap] ❌ Erro ao aguardar Redis estar pronto:', error);
-              console.warn('[Bootstrap] ⚠️ MessageGroupingQueue será desabilitada - mensagens serão processadas imediatamente');
-              messageGroupingQueue = undefined;
-            }
+            await messageGroupingQueue.waitForReady();
+            console.log('[Bootstrap] ✅ BullMQ MessageGroupingQueue initialized');
           } catch (error) {
-            console.error('[Bootstrap] ❌ Erro ao inicializar BullMQ MessageGroupingQueue:', error);
-            console.error('[Bootstrap] ❌ Error details:', error instanceof Error ? error.message : String(error));
-            console.error('[Bootstrap] ❌ Error stack:', error instanceof Error ? error.stack : 'No stack');
-            console.error('[Bootstrap] ❌ Error name:', error instanceof Error ? error.name : 'Unknown');
-            // Não bloquear startup se MessageGroupingQueue falhar
+            console.error('[Bootstrap] ❌ Erro ao inicializar MessageGroupingQueue:', error);
             messageGroupingQueue = undefined;
-            console.warn('[Bootstrap] ⚠️ MessageGroupingQueue desabilitado - mensagens serão processadas imediatamente');
           }
-        } catch (error) {
-          console.error('[Bootstrap] ❌ Erro ao inicializar BullMQ FeedbackQueue:', error);
-          console.error('[Bootstrap] ❌ Error details:', error instanceof Error ? error.message : String(error));
-          // Não bloquear startup se FeedbackQueue falhar
         }
       } catch (error) {
-        console.error('[Bootstrap] ❌ Failed to initialize BullMQ:', error instanceof Error ? error.message : String(error));
-        console.error('[Bootstrap] ❌ Error stack:', error instanceof Error ? error.stack : 'No stack');
-        console.error('[Bootstrap] ❌ Verifique se:');
-        console.error('[Bootstrap]   1. As variáveis de ambiente do Redis estão corretas');
-        console.error('[Bootstrap]   2. O Redis está acessível e rodando');
-        console.error('[Bootstrap]   3. As credenciais estão corretas');
-        console.warn('[Bootstrap] ⚠️  Task expiration will not work. Tasks will still be created, but timeout of 20 minutes will not be enforced automatically.');
+        console.error('[Bootstrap] ❌ Failed to initialize BullMQ:', error);
       }
     }
   } else {
-    if (!taskService) {
-      console.log('[Bootstrap] ⚠️  BullMQ disabled (taskService not available)');
-    } else {
-      console.log('[Bootstrap] ⚠️  BullMQ disabled (set USE_BULLMQ=true to enable)');
-    }
+    console.log('[Bootstrap] ⚠️ BullMQ disabled (set USE_BULLMQ=true to enable)');
   }
-
-  console.log('[Bootstrap] Wiring event handlers...');
   wireEventHandlers({
     messageService,
     conversationOrchestrator,

@@ -6,6 +6,7 @@ import type { CompanyService } from '../company';
 import type { ConversationTaskService } from '../conversation-tasks/service';
 import { PostgresInternalContactRepository } from '../internal-contacts/repository-postgres';
 import { logger } from '../utils/logger';
+import { broadcastRealtimeEvent } from '../api/routes/whatsapp-status-sse';
 
 type EventHandlersDependencies = {
   messageService: MessageService;
@@ -14,10 +15,33 @@ type EventHandlersDependencies = {
   messageGroupingQueue?: import('../conversation-pipeline/queue/message-grouping-queue').MessageGroupingQueue;
 };
 
+let handlersWired = false;
+const processedEventIds = new Set<string>();
+
 export const wireEventHandlers = (deps: EventHandlersDependencies): void => {
+  if (handlersWired) {
+    logger.debug('⚠️ Event handlers already wired - skipping duplicate wiring');
+    return;
+  }
+  handlersWired = true;
+  
   const { messageService } = deps;
 
   eventBus.on<WhatsAppMessageReceivedEvent>('whatsapp.message.received', async (event) => {
+    // Evitar processamento duplo de eventos idênticos (Baileys as vezes repete o upsert)
+    if (processedEventIds.has(event.messageId)) {
+      logger.debug(`[DEBUG-IA] 🛡️ Evento duplicado ignorado: ${event.messageId}`);
+      return;
+    }
+    processedEventIds.add(event.messageId);
+    
+    // Limpar cache de IDs a cada 1000 mensagens
+    if (processedEventIds.size > 1000) {
+      const ids = Array.from(processedEventIds);
+      processedEventIds.clear();
+      ids.slice(-500).forEach(id => processedEventIds.add(id));
+    }
+
     logger.section('Mensagem Recebida', '📥');
     logger.message(`Nova mensagem recebida`, {
       messageId: event.messageId,
@@ -42,6 +66,11 @@ export const wireEventHandlers = (deps: EventHandlersDependencies): void => {
         baileysMessage: event.baileysMessage,
       });
       logger.success('Mensagem salva com sucesso', { messageId: event.messageId });
+
+      // Passo 0.5: Notificar Frontend IMEDIATAMENTE (antes da fila de IA)
+      // Isso garante que o usuário veja a mensagem e o unread_count atualizado na hora
+      logger.debug('[SSE] 📩 Propagando nova mensagem recebida via SSE');
+      broadcastRealtimeEvent('message_received', event);
 
       // Passo 1: AGrupamento Universal - TODAS as mensagens (cliente ou gerente) passam pelo agrupamento
       // A verificação de gerente será feita APÓS o agrupamento no Orchestrator
@@ -150,6 +179,10 @@ export const wireEventHandlers = (deps: EventHandlersDependencies): void => {
         },
       });
       logger.success('Mensagem enviada salva com sucesso', { messageId: event.messageId });
+
+      // Passo 0.5: Notificar Frontend IMEDIATAMENTE
+      logger.debug('[SSE] 📤 Propagando mensagem enviada via SSE');
+      broadcastRealtimeEvent('message_sent', event);
     } catch (error) {
       logger.error('Erro ao salvar mensagem enviada', { 
         error: error instanceof Error ? error.message : String(error),

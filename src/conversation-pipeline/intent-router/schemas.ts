@@ -9,18 +9,17 @@ import { z } from 'zod';
  */
 export const IntentSchema = z.enum([
   'URGENT_COMPLAINT',
-  'PRICE_INQUIRY',
+  'FAQ_QUERY',
   'STORE_INFO',
   'SALUTATION',
   'HUMAN_REQUEST',
-  'RESERVATION_REQUEST',
-  'ACKNOWLEDGMENT', // Confirmações passivas (ok, beleza, obrigado) - permite Silent Drop
-  'UNKNOWN', // Para mensagens incoerentes ou fora de contexto
+  'ACKNOWLEDGMENT',
+  'UNKNOWN',
 ]).describe(
-  "A intenção primária do usuário. Se for um elogio curto após feedback check-in, use SALUTATION ou mantenha o contexto de feedback. " +
-  "Se o usuário está respondendo a uma pergunta anterior do sistema (ex: 'Sim', 'Não', 'Armação'), mantenha o intent do fluxo anterior. " +
-  "Nunca use UNKNOWN se puder inferir pelo histórico ou contexto. Use UNKNOWN apenas para mensagens totalmente incoerentes ou fora do contexto de supermercado."
+  "A intenção primária do usuário. FAQ_QUERY: Para perguntas presentes na lista de dúvidas frequentes. " +
+  "UNKNOWN: Use para qualquer assunto que não esteja no FAQ ou quando a mensagem for incoerente."
 );
+
 
 export type Intent = z.infer<typeof IntentSchema>;
 
@@ -129,6 +128,9 @@ export const RouterResultSchema = z.object({
   isReputationAtRisk: z.boolean().describe(
     "true se sentiment === 'DISSATISFIED' ou intent === 'URGENT_COMPLAINT'. " +
     "Indica que a conversa requer atenção imediata para proteger a reputação da empresa."
+  ),
+  suggested_answer: z.string().optional().describe(
+    "O texto INTEGRAL do trecho do FAQ que resolve a dúvida. Populado pelo Orchestrator via RAG se intent === 'FAQ_QUERY'."
   ),
 });
 

@@ -33,7 +33,15 @@ export type ExecutorData =
   | FeedbackPromoterData
   | FeedbackDissatisfiedData
   | SilentDropData
-  | AlreadyPendingData;
+  | AlreadyPendingData
+  | FAQData;
+
+export type FAQData = {
+  type: 'faq_query';
+  question: string;
+  answer: string;
+};
+
 
 export type StoreInfoData = {
   type: 'store_info';

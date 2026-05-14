@@ -4,6 +4,7 @@ import type { WhatsAppAdapter } from '../../whatsapp';
 import type { NotificationService } from '../../notifications/service';
 import type { ConversationState } from '../../messages/types';
 import { z } from 'zod';
+import { eventBus } from '../../events';
 
 type ConversationRoutesDependencies = {
   messageService: MessageService;
@@ -739,6 +740,18 @@ export const registerConversationRoutes = (
       // Buscar conversa atualizada para retornar
       const updatedConversation = await messageService.getConversationById(id);
 
+      // SINCRONIZAÇÃO EM TEMPO REAL: Avisar o frontend que o estado mudou
+      if (updatedConversation) {
+        eventBus.emit('conversation.updated', {
+          tenantId,
+          conversationId: id,
+          updates: {
+            state: updatedConversation.state,
+            waitingHumanAt: updatedConversation.waitingHumanAt
+          }
+        });
+      }
+
       return {
         success: true,
         data: updatedConversation,
@@ -798,6 +811,20 @@ export const registerConversationRoutes = (
 
       // Buscar conversa atualizada para retornar
       const updatedConversation = await messageService.getConversationById(id, tenantId);
+
+      // SINCRONIZAÇÃO EM TEMPO REAL: Avisar o frontend que a IA foi desativada
+      if (updatedConversation) {
+        eventBus.emit('conversation.updated', {
+          tenantId,
+          conversationId: id,
+          updates: {
+            aiEnabled: false,
+            aiDisabledBy: 'human',
+            aiDisabledReason: body.reason || null,
+            aiDisabledAt: updatedConversation.aiDisabledAt
+          }
+        });
+      }
 
       return {
         success: true,
@@ -863,6 +890,22 @@ export const registerConversationRoutes = (
 
       // Buscar conversa atualizada para retornar
       const updatedConversation = await messageService.getConversationById(id, tenantId);
+
+      // SINCRONIZAÇÃO EM TEMPO REAL: Avisar o frontend que a IA foi reativada
+      if (updatedConversation) {
+        eventBus.emit('conversation.updated', {
+          tenantId,
+          conversationId: id,
+          updates: {
+            aiEnabled: true,
+            aiDisabledBy: null,
+            aiDisabledReason: null,
+            aiDisabledAt: null,
+            state: updatedConversation.state,
+            waitingHumanAt: null
+          }
+        });
+      }
 
       return {
         success: true,

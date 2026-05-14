@@ -23,28 +23,48 @@ class PostgresMessageRepository implements IMessageRepository {
    * 
    * Idempotência: PRIMARY KEY em 'id' garante que mesma messageId não duplica
    */
-  async findByConversationId(conversationId: string, tenantId: string): Promise<Message[]> {
+  async findByConversationId(conversationId: string, tenantId: string, limit?: number): Promise<Message[]> {
     try {
       // ORDENAÇÃO ROBUSTA: (timestamp, created_at, id) como tie-breaker
       // Isso garante ordem cronológica correta mesmo com:
       // - Timestamps iguais
       // - Mensagens chegando fora de ordem
       // - Reprocessamento de mensagens
-      const { data, error } = await supabase
+      let query = supabase
         .from('messages')
         .select('*')
         .eq('conversation_id', conversationId)
-        .eq('tenant_id', tenantId)
-        .order('timestamp', { ascending: true })
-        .order('created_at', { ascending: true })
-        .order('id', { ascending: true });
+        .eq('tenant_id', tenantId);
+
+      if (limit) {
+        // Se tem limite, busca os N mais recentes (DESC) e depois inverte
+        query = query
+          .order('timestamp', { ascending: false })
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .limit(limit);
+      } else {
+        // Sem limite, busca tudo ordem cronológica (ASC)
+        query = query
+          .order('timestamp', { ascending: true })
+          .order('created_at', { ascending: true })
+          .order('id', { ascending: true });
+      }
+
+      const { data, error } = await query;
 
       if (error) {
         console.error('[PostgresMessageRepository] Error fetching messages:', error);
         return [];
       }
 
-      const messages = (data || []).map(this.mapRowToMessage);
+      // Se usamos limit (veio DESC), precisamos reverter para ordem cronológica correta (mais velha para mais nova)
+      const rawData = data || [];
+      if (limit) {
+        rawData.reverse();
+      }
+
+      const messages = rawData.map(this.mapRowToMessage);
       
       // Validação adicional: garantir que timestamp está em milissegundos
       // Se algum timestamp estiver em segundos (< 10000000000), converter
@@ -1076,8 +1096,9 @@ class PostgresMessageRepository implements IMessageRepository {
       // Human handoff state
       waitingHumanAt: row.waiting_human_at ? new Date(row.waiting_human_at).getTime() : null,
       // Agent tracking
-      agentNames: agentNames.length > 0 ? agentNames : undefined,
       agentColors: Object.keys(agentColors).length > 0 ? agentColors : undefined,
+      totalTokens: row.total_tokens || 0,
+      totalCostUsd: row.total_cost_usd || 0,
     };
 
     // Log removido - request não essencial (fetch frequente)
@@ -1105,6 +1126,41 @@ class PostgresMessageRepository implements IMessageRepository {
     } catch (error) {
       console.error('[PostgresMessageRepository] ❌ Error in updateMessageText:', error);
       throw error;
+    }
+  }
+
+  async incrementTokenUsage(conversationId: string, tokens: number, costUsd: number, tenantId: string): Promise<void> {
+    try {
+      // Primeiro buscar valores atuais
+      const { data: conv, error: fetchError } = await supabase
+        .from('conversations')
+        .select('total_tokens, total_cost_usd')
+        .eq('id', conversationId)
+        .eq('tenant_id', tenantId)
+        .single();
+      
+      if (fetchError) throw fetchError;
+      
+      if (conv) {
+        const newTokens = (conv.total_tokens || 0) + tokens;
+        const newCost = (Number(conv.total_cost_usd) || 0) + costUsd;
+        
+        const { error: updateError } = await supabase
+          .from('conversations')
+          .update({ 
+            total_tokens: newTokens, 
+            total_cost_usd: newCost,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', conversationId)
+          .eq('tenant_id', tenantId);
+          
+        if (updateError) throw updateError;
+        
+        console.log(`[PostgresMessageRepository] 💰 Tokens incremented: +${tokens} (Total: ${newTokens})`);
+      }
+    } catch (error) {
+      console.error('[PostgresMessageRepository] ❌ Error in incrementTokenUsage:', error);
     }
   }
 }

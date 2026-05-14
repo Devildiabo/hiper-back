@@ -7,20 +7,9 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { createClient } from '@supabase/supabase-js';
 import { authMiddleware } from '../../auth';
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let supabaseAdmin: any = null;
 
-if (!supabaseUrl || !supabaseServiceKey) {
-  throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set for team management');
-}
-
-// Cliente Supabase Admin (bypass RLS)
-const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
-  auth: {
-    autoRefreshToken: false,
-    persistSession: false,
-  },
-});
+// O cliente será inicializado dentro de registerTeamRoutes
 
 type AddTeamMemberRequest = {
   name: string;
@@ -40,6 +29,21 @@ type TeamMember = {
 };
 
 export function registerTeamRoutes(fastify: FastifyInstance) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !supabaseServiceKey) {
+    console.warn('[Team] ⚠️ SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados. Rotas de equipe desativadas.');
+    return;
+  }
+
+  // Inicializar cliente Admin
+  supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
   // Listar membros da equipe
   fastify.get('/api/v1/team', async (request: FastifyRequest, reply: FastifyReply) => {
     try {

@@ -21,15 +21,19 @@ import type { StoreService } from '../../stores';
 import type { TicketService } from '../../tickets';
 import type { ConversationTaskService } from '../../conversation-tasks/service';
 import type { NotificationService } from '../../notifications/service';
-import { IntentRouter } from '../intent-router/router';
-import { EntityExtractorAgent } from '../intent-router/entity-extractor';
-import { IntentExecutor } from '../intent-executor/executor';
-import { Humanizer } from '../humanizer/humanizer';
 import { MediaProcessor } from '../media-processor/media-processor';
 import type { ContextSnapshot } from '../intent-router/types';
-import type { RouterResult, ConsolidatedRouterResult, Entities } from '../intent-router/schemas';
 import type { FeedbackQueue } from '../queue/feedback-queue';
 import type { WhatsAppAdapter } from '../../whatsapp/adapter';
+import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
+import { IntentRouter } from '../intent-router/router';
+import { 
+  runRAGSpecialist, 
+  runStoreAgent, 
+  runSmallTalkAgent, 
+  runVoiceAgent 
+} from '../ai-agents/specialists';
 
 type OrchestratorDependencies = {
   messageService: MessageService;
@@ -43,45 +47,31 @@ type OrchestratorDependencies = {
 };
 
 export class ConversationOrchestrator {
-  private router: IntentRouter;
-  private entityExtractor: EntityExtractorAgent;
-  private executor: IntentExecutor;
-  public readonly humanizer: Humanizer; // Expor para uso em pipeline handlers
   private mediaProcessor: MediaProcessor;
   private processedMessages: Set<string> = new Set();
+  private openai: OpenAI;
+  private supabase: any;
+  private router: IntentRouter;
 
   constructor(private deps: OrchestratorDependencies) {
-    this.router = new IntentRouter({
-      openaiApiKey: deps.openaiApiKey,
-    });
-    
-    this.entityExtractor = new EntityExtractorAgent({
-      openaiApiKey: deps.openaiApiKey,
-    });
-    
-    this.executor = new IntentExecutor({
-      storeService: deps.storeService,
-      ticketService: deps.ticketService,
-      notificationService: deps.notificationService,
-      messageService: deps.messageService, // Obrigatório
-      feedbackQueue: deps.feedbackQueue,
-      taskService: deps.taskService, // Para verificar tasks pendentes (conversas paralelas)
-    });
-    
-    this.humanizer = new Humanizer({
-      openaiApiKey: deps.openaiApiKey,
-    });
-
     this.mediaProcessor = new MediaProcessor({
       openaiApiKey: deps.openaiApiKey,
       whatsAppAdapter: deps.whatsAppAdapter,
     });
+
+    this.openai = new OpenAI({ apiKey: deps.openaiApiKey });
+    this.supabase = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+    this.router = new IntentRouter({ openaiApiKey: deps.openaiApiKey });
   }
 
   /**
    * Processa uma mensagem através do novo pipeline
    */
   async processMessage(messageId: string, conversationId: string): Promise<void> {
+    console.log('--- DEBUG_RAW: processMessage START ---', { messageId, conversationId });
     const processKey = `${messageId}:${conversationId}`;
     if (this.processedMessages.has(processKey)) {
       logger.warning('⚠️ Mensagem já processada - ignorando duplicata', {
@@ -140,6 +130,44 @@ export class ConversationOrchestrator {
         return;
       }
 
+      // Passo 1.1: Protocolo de 6 Horas - Auto-Reativação
+      if (!conversation.aiEnabled && conversation.aiDisabledAt) {
+        const cooldownMs = 6 * 60 * 60 * 1000;
+        const timePassed = Date.now() - new Date(conversation.aiDisabledAt).getTime();
+        
+        if (timePassed >= cooldownMs) {
+          logger.pipeline('🔄 Janela de 6h expirada - Reativando IA automaticamente', {
+            conversationId,
+            disabledAt: conversation.aiDisabledAt,
+            timePassedHours: (timePassed / (1000 * 60 * 60)).toFixed(1),
+          });
+          console.log(`[DEBUG-IA] 🔄 Janela de 6h expirada. Reativando IA para a conversa ${conversationId}.`);
+          
+          await this.deps.messageService.updateAIControl(conversationId, {
+            aiEnabled: true,
+            aiDisabledBy: null,
+            aiDisabledReason: 'Auto-reativação após ciclo de 6 horas',
+          }, tenantId);
+          
+          // Atualizar objeto local para continuar processamento
+          conversation.aiEnabled = true;
+        } else {
+          logger.pipeline('⏹️ IA desativada (Janela de 6h ativa)', {
+            conversationId,
+            hoursRemaining: ((cooldownMs - timePassed) / (1000 * 60 * 60)).toFixed(1),
+          });
+          console.log(`[DEBUG-IA] ⏹️ IA bloqueada pelo Protocolo de 6 Horas. Restam ${((cooldownMs - timePassed) / (1000 * 60 * 60)).toFixed(1)}h.`);
+          return; // Aborta processamento de IA
+        }
+      } else if (!conversation.aiEnabled) {
+        // Se estiver desativado sem timestamp (ex: manual via dashboard sem protocolo)
+        // Só processamos se o usuário explicitamente pedir (mas aqui abortamos por segurança)
+        logger.pipeline('⏹️ IA desativada manualmente para esta conversa', { conversationId });
+        return;
+      }
+
+
+
       // Passo 1.5: Processar mídia (áudio ou imagem) se necessário
       // Isso deve acontecer ANTES de verificar se há texto
       let processedText = message.text;
@@ -197,156 +225,11 @@ export class ConversationOrchestrator {
         return;
       }
 
-      // Passo 1.5: Verificar se é mensagem de gerente ANTES de processar pelo pipeline
-      // Isso garante que mensagens de gerente sejam tratadas corretamente após o agrupamento
-      const senderPhone = message.sender.phoneNumber || '';
-      const normalizedPhone = senderPhone.includes('@') ? senderPhone.split('@')[0] : senderPhone;
-      let isManager = false;
-      let managerStoreId: string | null = null;
-      
-      if (normalizedPhone) {
-        const { PostgresInternalContactRepository } = await import('../../internal-contacts/repository-postgres');
-        const internalContactRepo = new PostgresInternalContactRepository();
-        const internalContact = await internalContactRepo.findByPhoneNumber(normalizedPhone, tenantId);
-        
-        if (internalContact && internalContact.storeId && this.deps.taskService) {
-          isManager = true;
-          managerStoreId = internalContact.storeId;
-          
-          logger.pipeline('📞 Mensagem de gerente detectada - verificando tasks pendentes', {
-            phoneNumber: normalizedPhone,
-            contactType: internalContact.contactType,
-            storeId: internalContact.storeId,
-            traceId,
-          });
-          
-          // Buscar tasks pendentes da loja deste gerente
-          const pendingTasks = await this.deps.taskService.findPendingByStoreId(internalContact.storeId, tenantId);
-          
-          if (pendingTasks.length > 0) {
-            // Usar texto processado (pode ser de mídia ou agrupado)
-            const groupedText = processedText || '';
-            
-            if (groupedText) {
-              let matchedTask = null;
-              
-              if (pendingTasks.length === 1) {
-                matchedTask = pendingTasks[0];
-                logger.pipeline('✅ Task pendente encontrada - correlacionando resposta agrupada', {
-                  taskId: matchedTask.id,
-                  item: matchedTask.payload.item,
-                  conversationId: matchedTask.conversationId,
-                  textLength: groupedText.length,
-                  traceId,
-                });
-              } else {
-                // Múltiplas tasks - tentar correlacionar pelo conteúdo
-                logger.pipeline('⚠️ Múltiplas tasks pendentes - tentando correlacionar pelo conteúdo agrupado', {
-                  tasksCount: pendingTasks.length,
-                  textLength: groupedText.length,
-                  traceId,
-                });
-                
-                const responseLower = groupedText.toLowerCase();
-                for (const task of pendingTasks) {
-                  const itemLower = task.payload.item?.toLowerCase() || '';
-                  if (itemLower && (responseLower.includes(itemLower) || itemLower.includes(responseLower))) {
-                    matchedTask = task;
-                    break;
-                  }
-                }
-                
-                if (!matchedTask) {
-                  matchedTask = pendingTasks[0]; // Mais recente
-                  logger.pipeline('ℹ️ Usando task mais recente (não foi possível correlacionar por conteúdo)', {
-                    taskId: matchedTask.id,
-                    traceId,
-                  });
-                }
-              }
-              
-              if (matchedTask) {
-                // Completar task com o texto agrupado (texto completo de todas as mensagens)
-                await this.deps.taskService.completeTask(matchedTask.id, groupedText.trim(), tenantId);
-                
-                logger.success('✅ Task completada pelo gerente com texto agrupado', {
-                  taskId: matchedTask.id,
-                  conversationId: matchedTask.conversationId,
-                  textLength: groupedText.length,
-                  traceId,
-                });
-                
-                // Limpar waiting_human quando gerente completar task
-                if (conversation.state === 'waiting_human' || conversation.waitingHumanAt) {
-                  try {
-                    await this.deps.messageService.clearWaitingHuman(conversationId, tenantId);
-                    
-                    // Marcar notificações como lidas
-                    if (this.deps.notificationService) {
-                      await this.deps.notificationService.markConversationAsRead(conversationId, tenantId);
-                    }
-                    
-                    logger.success('✅ Waiting_human limpo - gerente completou task', {
-                      conversationId,
-                      traceId,
-                    });
-                  } catch (error) {
-                    logger.error('❌ Erro ao limpar waiting_human', {
-                      error: error instanceof Error ? error.message : String(error),
-                    });
-                  }
-                }
-                
-                // NÃO processar pelo pipeline (é mensagem interna)
-                return;
-              }
-            }
-          } else {
-            logger.debug('ℹ️ Nenhuma task pendente encontrada para este gerente', {
-              phoneNumber: normalizedPhone,
-              storeId: internalContact.storeId,
-              traceId,
-            });
-            
-            // Limpar waiting_human quando gerente enviar mensagem (mesmo sem task pendente)
-            if (conversation.state === 'waiting_human' || conversation.waitingHumanAt) {
-              try {
-                await this.deps.messageService.clearWaitingHuman(conversationId, tenantId);
-                
-                // Marcar notificações como lidas
-                if (this.deps.notificationService) {
-                  await this.deps.notificationService.markConversationAsRead(conversationId, tenantId);
-                }
-                
-                logger.success('✅ Waiting_human limpo - gerente enviou mensagem (sem task)', {
-                  conversationId,
-                  traceId,
-                });
-              } catch (error) {
-                logger.error('❌ Erro ao limpar waiting_human', {
-                  error: error instanceof Error ? error.message : String(error),
-                });
-              }
-            }
-            
-            // Continuar processamento normal - gerente sem task pendente
-            // Mas vamos bloquear intents de cliente no Router
-          }
-        }
-      }
-
-      // Verificar se IA está habilitada
-      if (conversation.aiEnabled === false) {
-        logger.pipeline('🚫 IA desabilitada para esta conversa', {
-          conversationId,
-          traceId,
-        });
-        return;
-      }
 
       // GATE: Verificar se há ticket não resolvido para esta conversa
       // Se houver ticket com status != 'closed', manter IA desligada
       if (this.deps.ticketService) {
+
         try {
           logger.pipeline('🔍 Verificando tickets pendentes', {
             conversationId,
@@ -427,6 +310,9 @@ export class ConversationOrchestrator {
         lastSystemAction,
       });
 
+      // Acumulador de uso de tokens para a sessão
+      let totalUsage = 0;
+
       // Passo 2.6: Buscar lista de lojas para o Router fazer matching preciso
       let availableStores: Array<{ id: string; name: string; neighborhood: string }> = [];
       try {
@@ -447,660 +333,184 @@ export class ConversationOrchestrator {
         });
       }
 
-      // Passo 3: Router - Classificar Intent e Sentimento
-      logger.section('Router - Classificação', '🧠');
-      logger.pipeline('🔍 Iniciando classificação no Router', {
-        traceId,
-        messageText: (processedText || message.text || '').substring(0, 100),
-        hasHistory: messageHistory.length > 0,
+      // Passo 3: Chamada do Novo Orquestrador Local (MULT-AGENT PIPELINE)
+      logger.section('Orquestrador de Agentes (Local)', '🚀');
+      
+      const messageTextToProcess = processedText || message.text || '';
+      const userName = message.sender.pushName || conversation.participantName || 'Cliente';
+
+      // 3.1: Roteamento de Intenção
+      logger.pipeline('[IA] Acionando Intent Router Local...', { traceId });
+      const routerResult = await this.router.classify({
+        messageText: messageTextToProcess,
+        messageHistory: messageHistory
       });
       
-      let routerResult: RouterResult;
-      try {
-        routerResult = await this.router.classify({
-          messageId,
-          conversationId,
-          messageText: processedText || message.text || '',
-          contextSnapshot,
-          messageHistory, // Enviar histórico para resolver ambiguidades
-          availableStores, // Enviar lista de lojas para matching preciso
-          isManager, // Informar se o remetente é um gerente
-          lastSystemAction, // Última ação do sistema para contexto
-          traceId, // Passar traceId para rastreabilidade
-        });
-        
-        logger.pipeline('✅ Router concluído com sucesso', {
-          traceId,
-          intent: routerResult.intent,
-          sentiment: routerResult.sentiment,
-          confidence: routerResult.confidence,
-        });
-      } catch (error) {
-        logger.error('❌ Erro no Router', {
-          traceId,
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        });
-        throw error; // Re-throw para ser capturado pelo catch externo
-      }
-
-      // Passo 3.5: Entity Extraction (se necessário)
-      // Chamar EntityExtractorAgent apenas para intents que dependem de dados concretos
-      const intentsRequiringExtraction = ['PRICE_INQUIRY', 'RESERVATION_REQUEST'];
-      let entities: Entities | null = null;
+      logger.pipeline(`[IA] ✅ Intenção: ${routerResult.intent}`, { traceId });
       
-      if (intentsRequiringExtraction.includes(routerResult.intent)) {
-        logger.section('Entity Extractor - Extração', '🔍');
-        logger.pipeline('🔍 Iniciando extração de entidades', {
-          traceId,
-          intent: routerResult.intent,
-        });
+      let agentResponse: string | null = null;
+      let shouldSend = true;
+
+      // 3.2: Execução do Especialista
+      if (['FAQ_QUERY', 'URGENT_COMPLAINT'].includes(routerResult.intent)) {
+        logger.pipeline('[FLOW] Acionando RAG Specialist...', { traceId });
+        const identifiedStore = routerResult.entities?.store_name || null;
+        agentResponse = await runRAGSpecialist(
+          this.openai, 
+          this.supabase, 
+          messageTextToProcess, 
+          messageHistory, 
+          routerResult.intent,
+          identifiedStore
+        );
+      } 
+      else if (routerResult.intent === 'STORE_INFO') {
+        const storeSearchTerm = routerResult.entities?.store_name || routerResult.subject || '';
+        logger.pipeline(`[DB] Buscando dados da loja para: ${storeSearchTerm}...`, { traceId });
         
-        try {
-          const extractionResult = await this.entityExtractor.extract({
-            messageText: processedText || message.text || '',
-            messageHistory,
-            availableStores,
-            traceId,
-            intent: routerResult.intent,
-          });
-          
-          // Converter EntityExtractorResult para Entities (compatibilidade)
-          entities = {
-            store_name: extractionResult.store_name,
-            store: extractionResult.store,
-            product_name: extractionResult.product_name,
-            product: extractionResult.product,
-            department: extractionResult.department,
-            price: extractionResult.price,
-            location: extractionResult.location,
-            is_promotion_query: extractionResult.is_promotion_query,
-            pickup_time: extractionResult.pickup_time,
-            quantity: extractionResult.quantity,
-          };
-          
-          logger.pipeline('✅ Extração de entidades concluída', {
-            traceId,
-            product_name: entities.product_name,
-            store_name: entities.store_name,
-            is_promotion_query: entities.is_promotion_query,
-          });
-        } catch (error) {
-          logger.error('❌ Erro no Entity Extractor', {
-            traceId,
-            error: error instanceof Error ? error.message : String(error),
-            stack: error instanceof Error ? error.stack : undefined,
-          });
-          // Continuar com entities = null (fallback seguro)
-          logger.warning('⚠️ Continuando sem entidades extraídas (fallback)', { traceId });
-        }
-      } else {
-        logger.pipeline('⏭️ Pulando extração de entidades (intent não requer)', {
-          traceId,
-          intent: routerResult.intent,
-        });
-      }
+        // Busca fuzzy de loja no DB
+        const { data: storeData } = await this.supabase
+          .from('stores')
+          .select('*')
+          .or(`name.ilike.%${storeSearchTerm}%,neighborhood.ilike.%${storeSearchTerm}%`)
+          .eq('tenant_id', tenantId)
+          .eq('is_active', true)
+          .limit(1);
 
-      // Consolidar RouterResult + Entities para passar ao Executor
-      const consolidatedResult: ConsolidatedRouterResult = {
-        ...routerResult,
-        entities: entities || {
-          store_name: null,
-          store: null,
-          product_name: null,
-          product: null,
-          department: null,
-          price: null,
-          location: null,
-          is_promotion_query: null,
-          pickup_time: null,
-          quantity: null,
-        },
-      };
-
-      // Passo 4: CORTE CEDO DO PIPELINE - Se confiança < 0.8, parar ANTES de chamar Executor ou Agente Boca
-      // Se confiança < 0.8 OU intent for UNKNOWN, criar notificação waiting_human e PARAR o processamento
-      const isLowConfidence = consolidatedResult.confidence < 0.8 || consolidatedResult.intent === 'UNKNOWN';
-      
-      if (isLowConfidence && this.deps.notificationService && this.deps.messageService) {
-        logger.warning('⚠️ Confiança baixa ou intent UNKNOWN detectado - CORTANDO PIPELINE CEDO e acionando humano', {
-          conversationId,
-          intent: consolidatedResult.intent,
-          confidence: consolidatedResult.confidence,
-        });
-
-        try {
-          const store = contextSnapshot.selectedStoreId 
-            ? await this.deps.storeService.getStoreById(contextSnapshot.selectedStoreId, tenantId)
-            : null;
-
-          await this.deps.notificationService.createNotification({
-            tenantId,
-            type: 'waiting_human',
-            conversationId,
-            metadata: {
-              reason: consolidatedResult.intent === 'UNKNOWN' ? 'incoherent_message' : 'ai_uncertainty',
-              confidence: consolidatedResult.confidence,
-              intent: consolidatedResult.intent,
-              storeId: contextSnapshot.selectedStoreId || undefined,
-              storeName: store?.name || contextSnapshot.selectedStoreName || undefined,
-              lastMessagePreview: (processedText || message.text || '').substring(0, 100),
-              priority: 'normal',
-            },
-          });
-
-          // Alterar status da conversa para WAITING_HUMAN
-          await this.deps.messageService.updateConversationState(conversationId, 'waiting_human', tenantId);
-
-          // Desativar IA automaticamente
-          await this.deps.messageService.updateAIControl(conversationId, {
-            aiEnabled: false,
-            aiDisabledBy: 'system',
-            aiDisabledReason: consolidatedResult.intent === 'UNKNOWN' 
-              ? 'Mensagem incoerente ou fora de contexto' 
-              : 'Incerteza da IA - confiança muito baixa',
-          }, tenantId);
-
-          // Gerar mensagem de transição usando Humanizer
-          const userName = message.sender.pushName || conversation.participantName || undefined;
-          let humanizedText: string;
-          
-          try {
-            humanizedText = await this.humanizer.humanize({
-              executorData: {
-                type: 'handoff',
-                reason: consolidatedResult.intent === 'UNKNOWN' ? 'ai_uncertainty' : 'ai_uncertainty',
-                ticketCreated: false,
-              },
-              intent: consolidatedResult.intent,
-              sentiment: consolidatedResult.sentiment,
-              isReputationAtRisk: consolidatedResult.isReputationAtRisk,
-              userName,
-              userMessage: processedText || message.text || '',
-            });
-          } catch (error) {
-            logger.error('❌ Erro no Agente Boca para mensagem de transição', {
-              error: error instanceof Error ? error.message : String(error),
-            });
-            // Fallback simples
-            humanizedText = userName 
-              ? `${userName}, para não te dar nenhuma informação errada, vou passar sua dúvida para um atendente humano que já te responde por aqui, ok?`
-              : 'Para não te dar nenhuma informação errada, vou passar sua dúvida para um atendente humano que já te responde por aqui, ok?';
-          }
-
-          // Emitir evento de handoff
-          eventBus.emit('conversation.handoff.requested', {
-            tenantId,
-            conversationId,
-            storeId: contextSnapshot.selectedStoreId || null,
-            reason: consolidatedResult.intent === 'UNKNOWN' ? 'incoherent_message' : 'ai_uncertainty',
-            severity: 'normal',
-            timestamp: Date.now(),
-            lastMessagePreview: (processedText || message.text || '').substring(0, 100),
-          }, traceId);
-
-          // Enviar resposta de transição
-          eventBus.emit('conversation.response.generated', {
-            messageId,
-            conversationId,
-            response: { text: humanizedText },
-            brainDecision: 'WAIT_FOR_HUMAN',
-            timestamp: Date.now(),
-            traceId,
-          }, traceId);
-
-          logger.success('✅ Pipeline cortado cedo - waiting_human acionado e mensagem de transição enviada', {
-            conversationId,
-            confidence: consolidatedResult.confidence,
-            intent: consolidatedResult.intent,
-          });
-          
-          // PARAR O PROCESSAMENTO AQUI - não chamar Executor nem continuar o pipeline
-          return;
-        } catch (error) {
-          logger.error('❌ Erro ao criar notificação waiting_human por incerteza', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-          // Mesmo em caso de erro, tentar parar o pipeline para não gerar resposta absurda
-          return;
-        }
-      }
-
-      // Passo 4.5: Atualizar is_reputation_at_risk se necessário
-      if (consolidatedResult.isReputationAtRisk && !conversation.isReputationAtRisk) {
-        await this.deps.messageService.updateConversation(conversationId, {
-          isReputationAtRisk: true,
-        }, tenantId);
-        
-        logger.warning('⚠️ Reputação em risco detectada', {
-          conversationId,
-          intent: consolidatedResult.intent,
-          sentiment: consolidatedResult.sentiment,
-        });
-
-        // Emitir evento de reputação em risco
-        eventBus.emit('conversation.reputation.at.risk', {
-          conversationId,
-          tenantId,
-          intent: consolidatedResult.intent,
-          sentiment: consolidatedResult.sentiment,
-          timestamp: Date.now(),
-        }, traceId);
-      }
-
-      // Passo 4.5: CURTO-CIRCUITO ABSOLUTO - ACKNOWLEDGMENT (Silent Drop)
-      // Esta verificação DEVE vir ANTES de qualquer outra lógica (tasks, executor, etc.)
-      // Se o usuário apenas confirmou/agradeceu, encerrar imediatamente sem processar mais nada
-      if (consolidatedResult.intent === 'ACKNOWLEDGMENT') {
-        logger.pipeline('🔇 Intent ACKNOWLEDGMENT detectado. Realizando Silent Drop.', {
-          traceId,
-          conversationId,
-          messageId,
-          intent: consolidatedResult.intent,
-          sentiment: consolidatedResult.sentiment,
-        });
-        
-        logger.info('✅ Mensagem ignorada (Silent Drop): Usuário apenas confirmou/agradeceu', {
-          traceId,
-          conversationId,
-          messageId,
-          messageText: processedText || message.text || '',
-        });
-        
-        // Encerrar processamento imediatamente - NÃO chamar Executor, NÃO verificar tasks, NÃO chamar Humanizer
-        return;
-      }
-
-      // Passo 5: Removido bloqueio global de tasks pendentes
-      // A verificação de tasks pendentes agora é feita apenas no Executor,
-      // e apenas para intents específicos (PRICE_INQUIRY) sobre o mesmo produto.
-      // Isso permite conversas paralelas (ex: perguntar horário enquanto aguarda preço).
-
-      // Passo 5.5: Filtro de Sentido Comum - Validar se o intent faz sentido com as entidades
-      // Se for STORE_INFO mas as entidades não baterem com (horário, endereço, telefone, preço), forçar confidence baixa
-      if (consolidatedResult.intent === 'STORE_INFO' && consolidatedResult.confidence >= 0.8) {
-        const messageLower = (processedText || message.text || '').toLowerCase();
-        const hasStoreInfoKeywords = 
-          messageLower.includes('horário') || messageLower.includes('horario') || messageLower.includes('abre') || messageLower.includes('fecha') ||
-          messageLower.includes('endereço') || messageLower.includes('endereco') || messageLower.includes('onde') || messageLower.includes('local') ||
-          messageLower.includes('telefone') || messageLower.includes('contato') || messageLower.includes('fone') ||
-          messageLower.includes('preço') || messageLower.includes('preco') || messageLower.includes('valor') || messageLower.includes('custa');
-        
-        if (!hasStoreInfoKeywords) {
-          logger.warning('⚠️ STORE_INFO sem palavras-chave relevantes - forçando confidence baixa', {
-            traceId,
-            messagePreview: (processedText || message.text || '').substring(0, 100),
-            confidence: consolidatedResult.confidence,
-          });
-          
-          // Forçar confidence baixa para acionar corte cedo
-          routerResult.confidence = 0.25;
-          // O corte cedo (Passo 4) vai pegar isso e parar o pipeline
-        }
-      }
-
-      // Passo 6: Executor - Executar ação baseada no Intent
-      // NOTA: Se confidence < 0.8 ou intent UNKNOWN, o pipeline já foi cortado no Passo 4
-      // Se chegou aqui, significa que a confiança é >= 0.8 e o intent não é UNKNOWN
-      logger.section('Executor - Executando Ação', '⚙️');
-      logger.pipeline('🔍 Iniciando Executor', {
-        traceId,
-        intent: routerResult.intent,
-        sentiment: routerResult.sentiment,
-      });
-      
-      let executorResult: any;
-      try {
-        executorResult = await this.executor.execute({
-          messageId,
-          conversationId,
-          messageText: processedText || message.text || '',
-          routerResult: consolidatedResult, // Passar resultado consolidado (RouterResult + Entities)
-          contextSnapshot,
-          messageHistory, // Passar histórico para Trava de Contexto
-          tenantId,
-          traceId,
-        });
-        
-        logger.pipeline('✅ Executor concluído', {
-          traceId,
-          status: executorResult.status,
-          dataType: executorResult.data.type,
-          hasTaskRequest: !!executorResult.taskRequest,
-          hasHandoffReason: !!executorResult.handoffReason,
-          hasMergedEntities: !!executorResult.mergedEntities,
-          nextSystemAction: executorResult.nextSystemAction,
-        });
-      } catch (error) {
-        logger.error('❌ Erro no Executor', {
-          traceId,
-          intent: routerResult.intent,
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        });
-        throw error; // Re-throw para ser capturado pelo catch externo
-      }
-
-      // Passo 6.5: Persistir merged entities, nextSystemAction e retryCount (State Persistence)
-      if (executorResult.mergedEntities || executorResult.nextSystemAction) {
-        try {
-          const contextUpdate: any = {};
-          
-          // Persistir merged entities se disponível
-          if (executorResult.mergedEntities) {
-            contextUpdate.context_entities = executorResult.mergedEntities;
-            logger.pipeline('💾 Persistindo merged entities', {
-              traceId,
-              product_name: executorResult.mergedEntities.product_name,
-              store_name: executorResult.mergedEntities.store_name,
-            });
-          }
-          
-          // Persistir nextSystemAction e retryCount se disponível
-          if (executorResult.nextSystemAction) {
-            contextUpdate.lastSystemAction = executorResult.nextSystemAction;
-            
-            // Usar retryCount do Executor (já calculado pelo checkAntiLoop)
-            if (executorResult.retryCount) {
-              contextUpdate.retryCount = executorResult.retryCount;
-            }
-            
-            logger.pipeline('💾 Persistindo nextSystemAction e retryCount', {
-              traceId,
-              nextSystemAction: executorResult.nextSystemAction,
-              retryCount: executorResult.retryCount,
-            });
-          }
-          
-          if (Object.keys(contextUpdate).length > 0) {
-            await this.deps.messageService.updateConversation(conversationId, contextUpdate, tenantId);
-            logger.success('✅ Contexto atualizado no banco de dados', {
-              traceId,
-              updates: Object.keys(contextUpdate),
-            });
-          }
-        } catch (error) {
-          logger.error('❌ Erro ao persistir contexto (merged entities/nextSystemAction)', {
-            traceId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          // Não bloquear o fluxo se falhar ao persistir
-        }
-      }
-
-      // Passo 7: Processar resultado do Executor e gerar resposta com Agente Boca
-      logger.pipeline('🔍 Processando resultado do Executor', {
-        traceId,
-        status: executorResult.status,
-        dataType: executorResult.data.type,
-      });
-
-      // Verificar se é Silent Drop (ACKNOWLEDGMENT)
-      if (executorResult.status === 'silent_drop') {
-        logger.pipeline('🔇 Silent Drop detectado - encerrando processamento sem resposta', {
-          traceId,
-          reason: executorResult.data.type === 'silent_drop' ? (executorResult.data as any).reason : 'unknown',
-        });
-        
-        // Registrar no log e encerrar sem chamar Humanizer
-        logger.info('✅ Mensagem ignorada (Silent Drop): Usuário apenas confirmou/agradeceu', {
-          traceId,
-          conversationId,
-          messageId,
-          reason: executorResult.data.type === 'silent_drop' ? (executorResult.data as any).reason : 'unknown',
-        });
-        
-        // Encerrar processamento sem enviar mensagem
-        return;
-      }
-      
-      // Gerar resposta usando Agente Boca com dados estruturados do Executor
-      // O Agente Boca gera a resposta do zero usando as variáveis do Executor
-      let humanizedText: string;
-      try {
-        logger.pipeline('🎨 Chamando Agente Boca', {
-          traceId,
-          dataType: executorResult.data.type,
-        });
-        
-        // Extrair userName (pushName) da mensagem para personalização
-        const userName = message.sender.pushName || conversation.participantName || undefined;
-        
-        humanizedText = await this.humanizer.humanize({
-          executorData: executorResult.data,
-          intent: routerResult.intent,
-          sentiment: routerResult.sentiment,
-          isReputationAtRisk: routerResult.isReputationAtRisk,
-          userName, // Nome do cliente para personalização
-          userMessage: message.text, // Mensagem original para espelhamento
-        });
-        
-        logger.pipeline('✅ Agente Boca concluído', {
-          traceId,
-          humanizedTextPreview: humanizedText.substring(0, 100),
-        });
-      } catch (error) {
-        logger.error('❌ Erro no Agente Boca', {
-          traceId,
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        });
-        // Fallback será tratado pelo Humanizer internamente
-        throw error;
-      }
-
-      // Processar baseado no status do Executor
-      if (executorResult.status === 'already_pending') {
-        // Task já pendente sobre o mesmo produto - avisar que ainda está aguardando
-        logger.pipeline('⏳ Task já pendente detectada - avisando que ainda está aguardando', {
-          traceId,
-          dataType: executorResult.data.type,
-        });
-
-        // Gerar mensagem de aviso usando Agente Boca
-        let humanizedWaitMessage: string;
-        try {
-          humanizedWaitMessage = await this.humanizer.humanize({
-            executorData: executorResult.data,
-            intent: consolidatedResult.intent,
-            sentiment: consolidatedResult.sentiment,
-            userName: message.sender.pushName || conversation.participantName || undefined,
-            userMessage: message.text,
-          });
-        } catch (error) {
-          logger.error('❌ Erro no Agente Boca (already_pending)', {
-            traceId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          humanizedWaitMessage = 'Ainda estou aguardando a resposta do gerente sobre isso. Assim que eu tiver a confirmação, te aviso por aqui! 😊';
-        }
-
-        eventBus.emit('conversation.response.generated', {
-          messageId,
-          conversationId,
-          response: { text: humanizedWaitMessage },
-          brainDecision: 'ALLOW_AUTO_RESPONSE',
-          timestamp: Date.now(),
-          traceId,
-        }, traceId);
-
-        logger.pipeline('✅ Mensagem de "já pendente" enviada', { traceId });
-        return;
-      } else if (executorResult.status === 'done' || executorResult.status === 'need_input' || executorResult.status === 'reservation_confirmed') {
-        logger.pipeline('📤 Emitindo evento conversation.response.generated', {
-          traceId,
-          messageId,
-          conversationId,
-          status: executorResult.status,
-        });
-        
-        eventBus.emit('conversation.response.generated', {
-          messageId,
-          conversationId,
-          response: { text: humanizedText },
-          brainDecision: 'ALLOW_AUTO_RESPONSE',
-          timestamp: Date.now(),
-          traceId,
-        }, traceId);
-        
-        logger.pipeline('✅ Resposta enviada', { traceId });
-
-        // Se for reserva confirmada, o feedback já foi agendado pelo Executor
-        // (o FeedbackQueue foi chamado diretamente no Executor)
-        if (executorResult.status === 'reservation_confirmed' && executorResult.feedbackScheduleRequest) {
-          logger.success('✅ Reserva confirmada e feedback agendado', {
-            traceId,
-            conversationId,
-            pickupTime: new Date(executorResult.feedbackScheduleRequest.pickupTime).toISOString(),
-          });
-        }
-
-      } else if (executorResult.status === 'task_created' && executorResult.taskRequest) {
-        // Task criada - criar conversation_task e enviar mensagem ao gerente
-        logger.pipeline('📋 Task criada pelo Executor - processando', {
-          traceId,
-          taskType: executorResult.taskRequest.type,
-          storeId: executorResult.taskRequest.storeId,
-        });
-
-        if (this.deps.taskService) {
-          try {
-            // Criar task com tenantId
-            logger.pipeline('💾 Criando task no banco', {
-              traceId,
-              storeId: executorResult.taskRequest.storeId,
-              type: executorResult.taskRequest.type,
-            });
-            
-            const task = await this.deps.taskService.createTask({
-              tenantId,
-              conversationId,
-              storeId: executorResult.taskRequest.storeId,
-              type: executorResult.taskRequest.type,
-              payload: executorResult.taskRequest.payload,
-              requestCode: `REQ:${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
-              expiresAt: Date.now() + 20 * 60 * 1000, // 20 minutos
-            });
-
-            logger.success('✅ Task criada', {
-              traceId,
-              taskId: task.id,
-              conversationId,
-              storeId: executorResult.taskRequest.storeId,
-            });
-
-          // Resposta já foi gerada pelo Agente Boca acima
-          eventBus.emit('conversation.response.generated', {
-            messageId,
-            conversationId,
-            response: { text: humanizedText },
-            brainDecision: 'ALLOW_AUTO_RESPONSE',
-            timestamp: Date.now(),
-            traceId,
-          }, traceId);
-          
-          logger.pipeline('✅ Resposta de task enviada', { traceId });
-          } catch (error) {
-            logger.error('❌ Erro ao criar task', {
-              traceId,
-              error: error instanceof Error ? error.message : String(error),
-              stack: error instanceof Error ? error.stack : undefined,
-            });
-            throw error;
-          }
+        const targetStore = storeData?.[0] || null;
+        if (targetStore) {
+          logger.pipeline(`[DB] ✅ Loja encontrada: ${targetStore.name}`, { traceId });
         } else {
-          logger.warning('⚠️ TaskService não disponível - não foi possível criar task', {
-            traceId,
-          });
+          logger.warning(`[DB] ⚠️ Nenhuma loja encontrada para o termo: ${storeSearchTerm}`, { traceId });
         }
 
-      } else if (executorResult.status === 'handoff') {
-        logger.pipeline('📝 Status: handoff - processando handoff', {
-          traceId,
-          handoffReason: executorResult.handoffReason,
-        });
+        const now = new Date();
+        const days = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
+        const currentTime = `${days[now.getDay()]}, ${now.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' })}`;
         
-        // Resposta já foi gerada pelo Agente Boca acima
+        agentResponse = await runStoreAgent(this.openai, targetStore, messageTextToProcess, messageHistory, currentTime);
+      }
+      else if (routerResult.intent === 'SALUTATION' || routerResult.intent === 'ACKNOWLEDGMENT') {
+        logger.pipeline('[FLOW] Acionando Small Talk Agent...', { traceId });
+        const talkResponse = await runSmallTalkAgent(this.openai, messageTextToProcess, messageHistory);
+        
+        if (talkResponse?.includes('[IGNORE]')) {
+          logger.pipeline('[SYSTEM] IA em silêncio para evitar loop.', { traceId });
+          shouldSend = false;
+        } else {
+          agentResponse = talkResponse;
+        }
+      }
+      else if (routerResult.intent === 'HUMAN_REQUEST') {
+        logger.pipeline('[SYSTEM] Handoff solicitado pelo usuário.', { traceId });
+        agentResponse = "Vou te passar agora mesmo para um de nossos atendentes humanos. Só um instantinho!";
+      }
+      else {
+        logger.pipeline('[SYSTEM] Intenção não mapeada ou ambígua.', { traceId });
+        agentResponse = "Não entendi muito bem. Poderia me explicar de outra forma para eu te ajudar melhor?";
+      }
 
-        // Desligar IA se necessário (apenas para URGENT_COMPLAINT, pois HUMAN_REQUEST e ai_uncertainty já foram tratados)
-        if (executorResult.handoffReason === 'urgent_complaint') {
+      // 3.3: Detecção de Handoff e Humanização Final
+      let finalResponse = agentResponse || "";
+      let isHandoffTriggered = agentResponse?.includes('[HANDOFF]') || routerResult.intent === 'HUMAN_REQUEST';
+
+      if (shouldSend && agentResponse) {
+          logger.pipeline('[VOICE] Humanizando resposta com Agente de Voz...', { traceId });
+          const technicalToHumanize = agentResponse.replace('[HANDOFF]', '').trim();
+          const userName = message.sender.pushName || conversation.participantName || 'Cliente';
+          finalResponse = await runVoiceAgent(this.openai, technicalToHumanize, messageTextToProcess, userName) || technicalToHumanize;
+      }
+
+      // Passo 4: Executar ação baseada no retorno
+      if (shouldSend && finalResponse) {
+        eventBus.emit('conversation.response.generated', {
+          messageId,
+          conversationId,
+          response: { text: finalResponse },
+          brainDecision: isHandoffTriggered ? 'WAIT_FOR_HUMAN' : 'ALLOW_AUTO_RESPONSE',
+          timestamp: Date.now(),
+          traceId,
+        }, traceId);
+
+        logger.success('✅ Resposta da IA enviada via WhatsApp', { traceId });
+      }
+
+      // Se for Handoff (explícito, via [HANDOFF] ou via reclamação urgente)
+      if (isHandoffTriggered || routerResult.intent === 'URGENT_COMPLAINT') {
+        const reason = isHandoffTriggered ? 'ai_handoff_requested' : 'urgent_complaint';
+        
+        await this.deps.messageService.updateAIControl(conversationId, {
+          aiEnabled: false,
+          aiDisabledBy: 'system',
+          aiDisabledReason: `Handoff automático: ${reason}`,
+          aiDisabledAt: new Date().toISOString()
+        }, tenantId);
+
+        // Criar Ticket se o serviço estiver disponível
+        if (this.deps.ticketService && routerResult.intent === 'URGENT_COMPLAINT') {
           try {
-            await this.deps.messageService.updateAIControl(conversationId, {
-              aiEnabled: false,
-              aiDisabledBy: 'system',
-              aiDisabledReason: 'urgent_complaint',
-            }, tenantId);
-            logger.pipeline('✅ IA desligada para conversa urgente', { traceId });
-          } catch (error) {
-            logger.error('❌ Erro ao desligar IA', {
-              traceId,
-              error: error instanceof Error ? error.message : String(error),
+            await this.deps.ticketService.create({
+              tenant_id: tenantId,
+              conversation_id: conversationId,
+              title: `Reclamação Urgente: ${routerResult.subject || 'Problema com produto/entrega'}`,
+              description: `O cliente relatou: "${messageTextToProcess}"`,
+              status: 'open',
+              priority: 'high',
+              source: 'whatsapp'
             });
+            logger.success('✅ Ticket de reclamação criado com sucesso', { traceId });
+          } catch (ticketError) {
+            logger.error('❌ Erro ao criar ticket automático', { traceId, error: ticketError });
           }
         }
 
-        // Emitir evento de handoff
-        logger.pipeline('📤 Emitindo evento handoff.requested', { traceId });
-        const severity = executorResult.handoffReason === 'urgent_complaint' ? 'high' : 'normal';
         eventBus.emit('conversation.handoff.requested', {
           tenantId,
           conversationId,
           storeId: contextSnapshot.selectedStoreId || null,
-          reason: executorResult.handoffReason || 'urgent_complaint',
-          severity,
+          reason: reason,
+          severity: routerResult.intent === 'URGENT_COMPLAINT' ? 'high' : 'normal',
           timestamp: Date.now(),
-          lastMessagePreview: (processedText || message.text || '').substring(0, 100),
+          lastMessagePreview: messageTextToProcess.substring(0, 100),
         }, traceId);
-
-        eventBus.emit('conversation.response.generated', {
-          messageId,
-          conversationId,
-          response: { text: humanizedText },
-          brainDecision: 'WAIT_FOR_HUMAN',
-          timestamp: Date.now(),
-          traceId,
-        }, traceId);
-        
-        logger.pipeline('✅ Handoff processado', { traceId });
       }
 
-      logger.success('✅ Processamento concluído', {
+      logger.success('✅ Processamento concluído (Nova Arquitetura)', {
         prefix: '[Orchestrator]',
         emoji: '✅',
         traceId,
       });
 
     } catch (error) {
-      logger.error('❌ Erro ao processar mensagem', {
-        prefix: '[Orchestrator]',
-        emoji: '❌',
-        traceId,
-        messageId,
-        conversationId,
-        error: error instanceof Error ? error.message : String(error),
-        errorName: error instanceof Error ? error.name : 'Unknown',
-        errorType: error instanceof Error ? error.constructor.name : typeof error,
-        stack: error instanceof Error ? error.stack : undefined,
-        // Adicionar contexto adicional
-        errorString: String(error),
-        errorJSON: JSON.stringify(error, Object.getOwnPropertyNames(error)),
-      });
+      console.log('--- DEBUG_RAW: CRITICAL ERROR IN ORCHESTRATOR ---');
+      console.log('Error Message:', error instanceof Error ? error.message : String(error));
       
-      // Log adicional para debug
-      console.error('\n═══════════════════════════════════════════════════════════');
-      console.error('❌ ERRO DETALHADO NO ORCHESTRATOR');
-      console.error('═══════════════════════════════════════════════════════════');
-      console.error('TraceId:', traceId);
-      console.error('MessageId:', messageId);
-      console.error('ConversationId:', conversationId);
-      console.error('Error Name:', error instanceof Error ? error.name : 'N/A');
-      console.error('Error Message:', error instanceof Error ? error.message : String(error));
-      console.error('Error Type:', error instanceof Error ? error.constructor.name : typeof error);
-      if (error instanceof Error && error.stack) {
-        console.error('\nStack Trace:');
-        console.error(error.stack);
+      // Fallback amigável para o usuário antes de passar para o humano
+      try {
+        const fallbackText = "No momento estamos com uma alta demanda e instabilidade nos nossos sistemas. Mas não se preocupe, um de nossos atendentes humanos já vai te ajudar por aqui em instantes! 😊";
+        
+        eventBus.emit('conversation.response.generated', {
+          messageId,
+          conversationId,
+          response: { text: fallbackText },
+          brainDecision: 'WAIT_FOR_HUMAN',
+          timestamp: Date.now(),
+          traceId,
+        }, traceId);
+
+        // Garantir que a conversa mude para waiting_human
+        const tenantId = await this.deps.messageService.getConversationTenantId(conversationId);
+        if (tenantId) {
+          await this.deps.messageService.updateConversationState(conversationId, 'waiting_human', tenantId);
+          await this.deps.messageService.updateAIControl(conversationId, {
+            aiEnabled: false,
+            aiDisabledBy: 'system',
+            aiDisabledReason: 'Erro crítico no pipeline (Fallback de Emergência)',
+          }, tenantId);
+        }
+      } catch (fallbackError) {
+        console.error('❌ Falha ao enviar resposta de fallback:', fallbackError);
       }
-      console.error('═══════════════════════════════════════════════════════════\n');
     }
   }
 
@@ -1260,7 +670,50 @@ export class ConversationOrchestrator {
     }
   }
 
+  /**
+   * Incrementa o uso de tokens da conversa
+   */
+  private async trackTokenUsage(conversationId: string, tokens: number, tenantId: string, traceId: string): Promise<void> {
+    try {
+      // Cálculo simplificado: US$ 0.00015 por 1k tokens (média gpt-4o-mini input/output + embeddings)
+      const costUsd = (tokens / 1000) * 0.00015;
+      
+      await this.deps.messageService.incrementTokenUsage(conversationId, tokens, costUsd, tenantId);
+      
+      logger.pipeline('💰 Token usage trackeado', {
+        traceId,
+        tokens,
+        costUsd,
+      });
+    } catch (error) {
+      logger.error('❌ Erro ao trackear uso de tokens', {
+        traceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private generateTraceId(): string {
     return `trace_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  }
+
+  /**
+   * Helper para pegar o horário atual em Brasília/Floripa
+   */
+  private getCurrentTimeBr(): string {
+    const now = new Date();
+    const brTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+    return `${brTime.getHours().toString().padStart(2, '0')}:${brTime.getMinutes().toString().padStart(2, '0')}`;
+  }
+
+  /**
+   * Helper para extrair o horário de fechamento da string de openingHours
+   * Formato esperado: "08:00 às 22:00"
+   */
+  private extractClosingTime(openingHours?: string): string | null {
+    if (!openingHours || !openingHours.includes('às')) return null;
+    const parts = openingHours.split('às').map(p => p.trim());
+    if (parts.length < 2) return null;
+    return parts[1]; // Ex: "22:00"
   }
 }

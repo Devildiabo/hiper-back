@@ -428,11 +428,16 @@ class WhatsAppAdapter {
       this.socket = makeWASocket({
         version,
         auth: cachedState,
-        logger, // Logger em nível info (limpo, foca em erros reais)
+        // Desativar histórico completo e marcar como offline para evitar syncs pesados (Issue #1769)
+        syncFullHistory: false,
+        markSessionAsOffline: true,
+        // Evitar queries iniciais demoradas que causam Timeout 408
+        shouldSyncHistoryMessage: () => false, 
+        getMessage: async () => undefined,
+        // Reduzir timeout de conexão para falhar rápido e tentar de novo se necessário
+        connectTimeoutMs: 20000, 
         // Browser nativo macOS (menos bloqueado pelo WhatsApp)
         browser: Browsers.macOS('Desktop'),
-        // Desativar histórico completo (CRUCIAL: não baixa conversas antigas - única otimização mantida)
-        syncFullHistory: false,
         // Imprimir QR no terminal para debug
         printQRInTerminal: true,
         // Ignorar JIDs de broadcast/newsletter/status - reduz tentativas de descriptografia inúteis
@@ -1008,9 +1013,11 @@ class WhatsAppAdapter {
       });
 
       this.socket.ev.on('messages.upsert', async (m) => {
+        console.log(`[WhatsApp] 📥 messages.upsert recebido: ${m.messages.length} mensagens`);
+        
         // FILTRO DE MENSAGENS: Separar motivos de descarte para diagnóstico preciso
         const now = Date.now();
-        const MAX_MESSAGE_AGE = 2 * 60 * 1000; // 2 minutos em milissegundos
+        const MAX_MESSAGE_AGE = 10 * 60 * 1000; // 10 minutos (mais tolerante)
         let filteredFromMe = 0;
         let filteredNoContent = 0;
         let filteredTooOld = 0;
@@ -1021,6 +1028,7 @@ class WhatsAppAdapter {
             return false;
           }
           if (!msg.message) {
+            console.log(`[WhatsApp] 🚫 Mensagem descartada: sem conteúdo (messageId: ${msg.key.id})`);
             filteredNoContent++;
             return false;
           }
@@ -1031,6 +1039,7 @@ class WhatsAppAdapter {
           if (messageTimestamp > 0) {
             const messageAge = now - (messageTimestamp * 1000);
             if (messageAge > MAX_MESSAGE_AGE) {
+              console.log(`[WhatsApp] 🚫 Mensagem descartada: muito antiga (${Math.round(messageAge/1000)}s atrás) (messageId: ${msg.key.id})`);
               filteredTooOld++;
               return false;
             }
@@ -1039,13 +1048,15 @@ class WhatsAppAdapter {
           return true;
         });
         
-        // LOG INTELIGENTE: Só logar quando há mensagens REAIS para processar
-        // Mensagens descartadas (fromMe, sem conteúdo, antigas) são normais e não precisam de log individual
+        // LOG INTELIGENTE
         if (recentMessages.length > 0) {
           const totalFiltered = filteredFromMe + filteredNoContent + filteredTooOld;
           console.log(`\n=== MESSAGES UPSERT ===`);
           console.log(`[${new Date().toISOString()}] Processing ${recentMessages.length} message(s)${totalFiltered > 0 ? ` | Descartadas: ${totalFiltered}` : ''}`);
           console.log(`========================`);
+        } else if (filteredFromMe === 0) {
+           // Só logar se não for apenas mensagens enviadas por mim (para evitar poluição)
+           console.log(`[WhatsApp] ℹ️ Nenhuma mensagem nova para processar (F: ${filteredFromMe}, N: ${filteredNoContent}, O: ${filteredTooOld})`);
         }
         
         const messages = recentMessages;
@@ -1216,6 +1227,21 @@ class WhatsAppAdapter {
     
     try {
       console.log(`[WhatsApp] 📤 Sending message to ${normalizedJid}`);
+      
+      // --- HUMANO DELAY (GlowAI Style) ---
+      // 1. Mostrar "Digitando..."
+      try {
+        await this.socket.sendPresenceUpdate('composing', normalizedJid);
+      } catch (e) {
+        console.error('[WhatsApp] Erro ao enviar status de digitando:', e);
+      }
+
+      // 2. Delay randômico (1.5s a 3.5s) para simular escrita humana
+      const delay = Math.floor(Math.random() * 2000) + 1500;
+      console.log(`[WhatsApp] ⏳ Aguardando ${delay}ms para simular digitação...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      // ------------------------------------
+
       console.log(`[WhatsApp] 📤 Original 'to' parameter: ${to}`);
       console.log(`[WhatsApp] 📤 Normalized JID: ${normalizedJid}`);
       console.log(`[WhatsApp] 📤 Message preview: ${content.substring(0, 50)}...`);
@@ -1233,8 +1259,10 @@ class WhatsAppAdapter {
         const cleanLink = rawLink.replace(/[.,;!?]+$/, '');
 
         try {
-          // Baixa a imagem diretamente para enviar os bytes brutos (Garante 100% de renderização no WhatsApp)
-          const imageUrl = "https://ooancmvihrxzgtegvmwn.supabase.co/storage/v1/object/public/whatsapp/banner.jpg";
+          // URL do banner montada dinamicamente a partir da env SUPABASE_URL
+          const supabaseBaseUrl = process.env.SUPABASE_URL || '';
+          const storageBucket = process.env.SUPABASE_STORAGE_BUCKET || 'whatsapp';
+          const imageUrl = `${supabaseBaseUrl}/storage/v1/object/public/${storageBucket}/banner.jpg`;
           const imageResponse = await fetch(imageUrl);
           const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
 
